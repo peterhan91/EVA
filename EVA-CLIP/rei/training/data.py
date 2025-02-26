@@ -12,6 +12,8 @@ from multiprocessing import Value
 import tarfile
 import zipfile
 import glob
+import lmdb
+from io import BytesIO
 
 # import braceexpand
 import numpy as np
@@ -39,6 +41,39 @@ warnings.filterwarnings("ignore")
 ImageFile.LOAD_TRUNCATED_IMAGES = True # Truncated File Read
 Image.MAX_IMAGE_PIXELS = None # DecompressionBombWarning
 ImageFile.MAX_IMAGE_PIXELS = None
+
+
+class LmdbDataset(Dataset):
+    def __init__(self, csv_path, lmdb_path, transforms, img_key, caption_key, tokenizer=None):
+        logging.debug(f'Loading image data from {lmdb_path}.')
+        self.lmdb_path = lmdb_path
+        df = pd.read_csv(csv_path)
+        
+        self.images = df[img_key].tolist()
+        self.captions = df[caption_key].tolist()
+        self.transforms = transforms
+        logging.debug('Done loading data.')
+        
+        self.tokenize = tokenizer
+        
+    def open_lmdb(self):
+        self.env = lmdb.open(self.lmdb_path,  
+                             readonly=True, 
+                             lock=False, readahead=False, meminit=False)
+        self.txn = self.env.begin(buffers=True)
+
+    def __len__(self):
+        return len(self.captions)
+
+    def __getitem__(self, idx):
+        if not hasattr(self, 'txn'):
+            self.open_lmdb()
+
+        img_data = self.txn.get(self.images[idx].decode())
+        images = self.transforms(Image.open(BytesIO(img_data)))
+        texts = self.tokenize([str(self.captions[idx])])[0]
+        return images, texts
+
 
 class CsvDataset(Dataset):
     def __init__(self, input_filename, transforms, img_key, caption_key, sep="\t", tokenizer=None):
@@ -625,9 +660,42 @@ def get_synthetic_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None
 
     return DataInfo(dataloader, sampler)
 
+
+def get_lmdb_dataset(args, preprocess_fn, is_train, epoch=0, tokenizer=None):
+    input_filename = args.train_data if is_train else args.val_data
+    csv_path = args.lmdb_csv_path
+    dataset = LmdbDataset(
+        csv_path=csv_path,
+        lmdb_path=input_filename,
+        transforms=preprocess_fn,
+        img_key=args.csv_img_key,
+        caption_key=args.csv_caption_key,        
+        tokenizer=tokenizer,
+    )
+    num_samples = len(dataset)
+    sampler = DistributedSampler(dataset) if args.distributed and is_train else None
+    shuffle = is_train and sampler is None
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=shuffle,
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=sampler,
+        drop_last=is_train,
+    )
+    dataloader.num_samples = num_samples
+    dataloader.num_batches = len(dataloader)
+
+    return DataInfo(dataloader, sampler)
+
+
 def get_dataset_fn(data_path, dataset_type):
     if dataset_type == "webdataset":
         return get_wds_dataset
+    elif dataset_type == "lmdb":
+        return get_lmdb_dataset
     elif dataset_type == "csv":
         return get_csv_dataset
     elif dataset_type == "synthetic":
@@ -636,6 +704,8 @@ def get_dataset_fn(data_path, dataset_type):
         ext = data_path.split('.')[-1]
         if ext in ['csv', 'tsv']:
             return get_csv_dataset
+        elif ext in ['lmdb']:
+            return get_lmdb_dataset
         elif ext in ['tar']:
             return get_wds_dataset
         else:

@@ -5,6 +5,7 @@ Copied from https://github.com/openai/CLIP. Originally MIT License, Copyright (c
 import gzip
 import html
 import os
+import json
 from functools import lru_cache
 from typing import Union, List
 
@@ -150,7 +151,9 @@ class SimpleTokenizer(object):
         return text
 
 
-_tokenizer = SimpleTokenizer()
+with open ('/hpcwork/p0021834/workspace_tianyu/HEST/CSV/tokens_new.json', 'r') as f:
+    genes = json.load(f)['genes']
+_tokenizer = SimpleTokenizer(special_tokens=[f'<{x}>' for x in genes] + [f'<exp_{x}>' for x in range(100)])
 
 
 def tokenize(texts: Union[str, List[str]], context_length: int = 77) -> torch.LongTensor:
